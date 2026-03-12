@@ -6,6 +6,7 @@ This script is analysis-only and does not execute trades.
 from __future__ import annotations
 
 import csv
+import json
 import math
 import os
 from dataclasses import dataclass
@@ -48,6 +49,22 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _normalize_list_field(value: Any) -> List[Any]:
+    """Normalize API fields that may be list values or JSON-encoded lists."""
+    if isinstance(value, list):
+        return value
+
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(parsed, list):
+            return parsed
+
+    return []
+
+
 def _parse_yes_no_prices(market: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
     """Extract YES/NO prices from common Polymarket payload formats."""
     # Format 1: explicit keys
@@ -55,9 +72,9 @@ def _parse_yes_no_prices(market: Dict[str, Any]) -> Tuple[Optional[float], Optio
         return _to_float(market.get("yesPrice"), -1), _to_float(market.get("noPrice"), -1)
 
     # Format 2: outcomes + outcomePrices arrays
-    outcomes = market.get("outcomes")
-    outcome_prices = market.get("outcomePrices")
-    if isinstance(outcomes, list) and isinstance(outcome_prices, list) and len(outcomes) == len(outcome_prices):
+    outcomes = _normalize_list_field(market.get("outcomes"))
+    outcome_prices = _normalize_list_field(market.get("outcomePrices"))
+    if outcomes and outcome_prices and len(outcomes) == len(outcome_prices):
         mapped = {str(name).strip().lower(): _to_float(price, -1) for name, price in zip(outcomes, outcome_prices)}
         if "yes" in mapped and "no" in mapped:
             return mapped["yes"], mapped["no"]

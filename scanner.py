@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, Iterable, List
 
 import requests
@@ -22,6 +23,12 @@ PAGE_LIMIT = 500
 def _normalize_tags(raw_tags: Any) -> List[str]:
     """从多种 tag 结构中提取字符串标签。"""
     tags: List[str] = []
+
+    if isinstance(raw_tags, str):
+        try:
+            raw_tags = json.loads(raw_tags)
+        except json.JSONDecodeError:
+            return tags
 
     if not isinstance(raw_tags, list):
         return tags
@@ -41,6 +48,12 @@ def _normalize_tags(raw_tags: Any) -> List[str]:
 def _extract_prices(market: Dict[str, Any]) -> List[float]:
     """提取 outcomePrices 并转换为 float 列表。"""
     raw_prices = market.get("outcomePrices")
+    if isinstance(raw_prices, str):
+        try:
+            raw_prices = json.loads(raw_prices)
+        except json.JSONDecodeError:
+            return []
+
     if not isinstance(raw_prices, list):
         return []
 
@@ -55,8 +68,8 @@ def _extract_prices(market: Dict[str, Any]) -> List[float]:
 
 
 def _passes_tag_filter(tags: Iterable[str]) -> bool:
-    lower_tags = {t.lower() for t in tags}
-    return any(tag in lower_tags for tag in ALLOWED_TAGS)
+    lower_tags = [t.lower() for t in tags]
+    return any(any(allowed in tag for tag in lower_tags) for allowed in ALLOWED_TAGS)
 
 
 def fetch_active_markets() -> List[Dict[str, Any]]:
