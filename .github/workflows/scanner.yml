@@ -1,1 +1,25 @@
+name: Polymarket Floor Scanner
 
+on:
+  schedule:
+    - cron: '0 * * * *'  # 每小时运行一次 (UTC时间)
+  workflow_dispatch:     # 允许你在页面上点击按钮手动运行
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install requests
+
+      - name: Run script
+        run: python your_script_name.py # 把这里改成你 GitHub 里那个 Python 文件的名字
