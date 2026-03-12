@@ -1,74 +1,74 @@
 # Polymarket Scanner
 
-A Python CLI project that scans active Polymarket markets and outputs a ranked list of potential trading opportunities for **manual review only**.
+A Python script that scans active Polymarket markets and ranks potential opportunities for **manual decision-making only**.
 
-> This tool does not execute trades. It only analyzes markets and surfaces opportunities.
+> This project does **not** execute trades. It only analyzes and ranks markets.
 
-## Project structure
+## Files
 
 ```text
-polymarket-scanner/
-    polymarket_scanner.py
-    config.py
-    requirements.txt
-    output/
-        opportunities.csv
-    README.md
+polymarket_scanner.py
+requirements.txt
+output/opportunities.csv
+README.md
 ```
 
-## Installation
+## Install
 
-1. (Optional) Create and activate a virtual environment:
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate
-   ```
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-## Run the scanner
+## Run
 
 ```bash
 python polymarket_scanner.py
 ```
 
 The script will:
-- Fetch all active markets from the Polymarket public Gamma API.
-- Filter out likely illiquid/inactive markets:
+- Fetch active markets from the Polymarket public API.
+- Extract market question, market id, YES/NO price, volume, liquidity, and end date.
+- Filter out markets with:
   - volume < 50,000 USD
   - liquidity < 10,000 USD
-  - resolved markets
-- Compute ranking metrics.
-- Print the top 20 opportunities in a formatted table.
-- Export results to `output/opportunities.csv`.
-
-## Opportunity score formula
-
-For each qualifying market:
-
-- `probability_yes = YES price`
-- `probability_no = NO price`
-- `spread = |YES + NO - 1|`
-- `liquidity_score = log(liquidity)`
-- `volume_score = log(volume)`
-
-Final score:
+  - resolved/inactive status
+- Compute per-market metrics:
+  - `probability_yes = YES price`
+  - `probability_no = NO price`
+  - `spread = |YES + NO - 1|`
+  - `liquidity_score = log(liquidity)`
+  - `volume_score = log(volume)`
+- Rank by:
 
 ```text
 opportunity_score =
-    (2 * spread) +
-    (0.5 * liquidity_score) +
-    (0.5 * volume_score)
+(2 * spread) +
+(0.5 * liquidity_score) +
+(0.5 * volume_score)
 ```
 
-Higher score favors:
-- greater pricing inefficiency (`spread`)
-- higher liquidity
-- higher trading volume
+- Print the top 20 opportunities in a formatted table.
+- Export results to `output/opportunities.csv`.
 
-## Notes
+## Output CSV
 
-- API errors and unexpected payload issues are handled with clear terminal errors.
-- Prices are interpreted from common Polymarket market payload shapes (`outcomes + outcomePrices`, token-based, or direct yes/no fields).
+The export contains:
+- rank
+- market_id
+- market_question
+- yes_price
+- no_price
+- volume
+- liquidity
+- end_date
+- spread
+- opportunity_score
+
+## Error handling
+
+The script includes explicit error handling for:
+- network/API failures
+- invalid API responses
+- malformed or missing market fields

@@ -1,2 +1,1 @@
-# No third-party dependencies required.
-# Uses only Python standard library modules.
+requests>=2.31.0

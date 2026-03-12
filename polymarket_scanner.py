@@ -1,6 +1,6 @@
-"""Scan Polymarket markets and rank potential trading opportunities.
+"""Polymarket market opportunity scanner.
 
-This script is analysis-only. It does not place any trades.
+This script is analysis-only and does not execute trades.
 """
 
 from __future__ import annotations
@@ -10,19 +10,22 @@ import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import json
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import urlopen
+import requests
 
-import config
+API_BASE_URL = "https://gamma-api.polymarket.com/markets"
+REQUEST_TIMEOUT_SECONDS = 20
+PAGE_SIZE = 500
+TOP_N_RESULTS = 20
+MIN_VOLUME_USD = 50_000
+MIN_LIQUIDITY_USD = 10_000
+OUTPUT_CSV_PATH = "output/opportunities.csv"
 
 
 @dataclass
 class MarketOpportunity:
-    """Normalized market fields plus derived metrics used for ranking."""
+    """Normalized market data + derived scores."""
 
     market_id: str
     question: str
@@ -38,22 +41,20 @@ class MarketOpportunity:
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
-    """Best-effort conversion of API values to float."""
+    """Convert API value to float with fallback."""
     try:
         return float(value)
     except (TypeError, ValueError):
         return default
 
 
-def _parse_yes_no_prices(market: Dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
-    """Extract YES/NO prices from several possible Polymarket payload shapes."""
-    # Shape A: explicit price fields
-    yes_direct = market.get("yesPrice")
-    no_direct = market.get("noPrice")
-    if yes_direct is not None and no_direct is not None:
-        return _to_float(yes_direct, -1), _to_float(no_direct, -1)
+def _parse_yes_no_prices(market: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    """Extract YES/NO prices from common Polymarket payload formats."""
+    # Format 1: explicit keys
+    if market.get("yesPrice") is not None and market.get("noPrice") is not None:
+        return _to_float(market.get("yesPrice"), -1), _to_float(market.get("noPrice"), -1)
 
-    # Shape B: outcomes + outcomePrices arrays (common in gamma API)
+    # Format 2: outcomes + outcomePrices arrays
     outcomes = market.get("outcomes")
     outcome_prices = market.get("outcomePrices")
     if isinstance(outcomes, list) and isinstance(outcome_prices, list) and len(outcomes) == len(outcome_prices):
@@ -61,48 +62,47 @@ def _parse_yes_no_prices(market: Dict[str, Any]) -> tuple[Optional[float], Optio
         if "yes" in mapped and "no" in mapped:
             return mapped["yes"], mapped["no"]
 
-    # Shape C: token objects with outcome + price
+    # Format 3: token objects
     tokens = market.get("tokens")
     if isinstance(tokens, list):
-        mapped = {}
+        mapped: Dict[str, float] = {}
         for token in tokens:
             if not isinstance(token, dict):
                 continue
             outcome = str(token.get("outcome", "")).strip().lower()
-            price = _to_float(token.get("price"), -1)
             if outcome:
-                mapped[outcome] = price
+                mapped[outcome] = _to_float(token.get("price"), -1)
         if "yes" in mapped and "no" in mapped:
             return mapped["yes"], mapped["no"]
 
     return None, None
 
 
-def _is_resolved_or_inactive(market: Dict[str, Any]) -> bool:
-    """Detect markets that are no longer tradable and should be ignored."""
+def _is_resolved(market: Dict[str, Any]) -> bool:
+    """Determine whether a market is resolved/inactive."""
     if market.get("resolved") is True or market.get("isResolved") is True:
         return True
 
-    # Additional common flags that indicate inactive state.
-    if market.get("closed") is True and market.get("active") is False:
+    if market.get("active") is False:
         return True
 
-    # If end date is in the past and the API marks it closed, treat as resolved/inactive.
+    if market.get("closed") is True:
+        return True
+
     end_date = market.get("endDate") or market.get("end_date") or market.get("closeTime")
-    if end_date and market.get("closed") is True:
+    if end_date:
         try:
-            end_dt = datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
-            if end_dt < datetime.now(timezone.utc):
+            dt = datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
+            if dt < datetime.now(timezone.utc) and market.get("closed") is True:
                 return True
         except ValueError:
-            # If parsing fails, do not auto-filter solely on date string.
             pass
 
     return False
 
 
 def fetch_active_markets() -> List[Dict[str, Any]]:
-    """Fetch all active markets from Polymarket's public Gamma API with pagination."""
+    """Fetch all active markets from the public Polymarket API."""
     all_markets: List[Dict[str, Any]] = []
     offset = 0
 
@@ -110,46 +110,46 @@ def fetch_active_markets() -> List[Dict[str, Any]]:
         params = {
             "active": "true",
             "closed": "false",
-            "limit": config.PAGE_SIZE,
+            "limit": PAGE_SIZE,
             "offset": offset,
         }
 
         try:
-            query_string = urlencode(params)
-            request_url = f"{config.API_BASE_URL}?{query_string}"
-            with urlopen(request_url, timeout=config.REQUEST_TIMEOUT_SECONDS) as response:
-                payload = response.read().decode("utf-8")
-            batch = json.loads(payload)
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"Failed to fetch markets from Polymarket API: {exc}") from exc
+            response = requests.get(API_BASE_URL, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+            response.raise_for_status()
+            batch = response.json()
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Failed to fetch markets: {exc}") from exc
+        except ValueError as exc:
+            raise RuntimeError(f"API returned invalid JSON: {exc}") from exc
 
         if not isinstance(batch, list):
-            raise RuntimeError("Unexpected API response format: expected a JSON list of markets.")
+            raise RuntimeError("Unexpected API response: expected a list of markets.")
 
         if not batch:
             break
 
         all_markets.extend(batch)
 
-        if len(batch) < config.PAGE_SIZE:
+        if len(batch) < PAGE_SIZE:
             break
 
-        offset += config.PAGE_SIZE
+        offset += PAGE_SIZE
 
     return all_markets
 
 
-def normalize_and_filter_markets(markets: Iterable[Dict[str, Any]]) -> List[MarketOpportunity]:
-    """Apply requirements-based filtering and compute ranking metrics."""
+def calculate_opportunities(markets: Iterable[Dict[str, Any]]) -> List[MarketOpportunity]:
+    """Filter markets and compute opportunity metrics/scores."""
     opportunities: List[MarketOpportunity] = []
 
     for market in markets:
-        if _is_resolved_or_inactive(market):
+        if _is_resolved(market):
             continue
 
-        question = str(market.get("question") or market.get("title") or "").strip()
         market_id = str(market.get("id") or market.get("conditionId") or "").strip()
-        if not question or not market_id:
+        question = str(market.get("question") or market.get("title") or "").strip()
+        if not market_id or not question:
             continue
 
         yes_price, no_price = _parse_yes_no_prices(market)
@@ -159,35 +159,36 @@ def normalize_and_filter_markets(markets: Iterable[Dict[str, Any]]) -> List[Mark
         if not (0 <= yes_price <= 1 and 0 <= no_price <= 1):
             continue
 
-        volume = _to_float(market.get("volume") or market.get("volumeNum") or market.get("volumeUsd"), 0.0)
-        liquidity = _to_float(market.get("liquidity") or market.get("liquidityNum") or market.get("liquidityUsd"), 0.0)
+        volume = _to_float(market.get("volume") or market.get("volumeNum") or market.get("volumeUsd"), 0)
+        liquidity = _to_float(market.get("liquidity") or market.get("liquidityNum") or market.get("liquidityUsd"), 0)
 
-        # Requirement: remove low-activity markets.
-        if volume < config.MIN_VOLUME_USD or liquidity < config.MIN_LIQUIDITY_USD:
+        # Required filters for illiquid/inactive markets.
+        if volume < MIN_VOLUME_USD or liquidity < MIN_LIQUIDITY_USD:
             continue
 
         if volume <= 0 or liquidity <= 0:
             continue
 
-        spread = abs((yes_price + no_price) - 1)
+        probability_yes = yes_price
+        probability_no = no_price
+
+        # Pricing inefficiency metric from requirements.
+        spread = abs((probability_yes + probability_no) - 1)
         liquidity_score = math.log(liquidity)
         volume_score = math.log(volume)
 
-        # Ranking formula from requirements:
-        # opportunity_score = (2 * spread) + (0.5 * liquidity_score) + (0.5 * volume_score)
+        # Required opportunity score formula.
         opportunity_score = (2 * spread) + (0.5 * liquidity_score) + (0.5 * volume_score)
-
-        end_date = str(market.get("endDate") or market.get("end_date") or market.get("closeTime") or "")
 
         opportunities.append(
             MarketOpportunity(
                 market_id=market_id,
                 question=question,
-                yes_price=yes_price,
-                no_price=no_price,
+                yes_price=probability_yes,
+                no_price=probability_no,
                 volume=volume,
                 liquidity=liquidity,
-                end_date=end_date,
+                end_date=str(market.get("endDate") or market.get("end_date") or market.get("closeTime") or ""),
                 spread=spread,
                 liquidity_score=liquidity_score,
                 volume_score=volume_score,
@@ -195,28 +196,23 @@ def normalize_and_filter_markets(markets: Iterable[Dict[str, Any]]) -> List[Mark
             )
         )
 
-    opportunities.sort(key=lambda item: item.opportunity_score, reverse=True)
-    return opportunities[: config.TOP_N_RESULTS]
+    opportunities.sort(key=lambda x: x.opportunity_score, reverse=True)
+    return opportunities[:TOP_N_RESULTS]
 
 
-def print_ranked_table(opportunities: List[MarketOpportunity]) -> None:
-    """Print a human-readable table of ranked opportunities."""
-    headers = [
-        "Rank",
-        "Market question",
-        "YES",
-        "NO",
-        "Volume",
-        "Liquidity",
-        "Spread",
-        "Opportunity",
-    ]
+def print_table(opportunities: List[MarketOpportunity]) -> None:
+    """Print ranked opportunity table to stdout."""
+    if not opportunities:
+        print("No qualifying opportunities found.")
+        return
 
+    headers = ["Rank", "Market question", "YES price", "NO price", "Volume", "Liquidity", "Spread", "Opportunity score"]
     rows = []
-    for idx, item in enumerate(opportunities, start=1):
+
+    for i, item in enumerate(opportunities, start=1):
         rows.append(
             [
-                str(idx),
+                str(i),
                 item.question,
                 f"{item.yes_price:.4f}",
                 f"{item.no_price:.4f}",
@@ -227,36 +223,26 @@ def print_ranked_table(opportunities: List[MarketOpportunity]) -> None:
             ]
         )
 
-    if not rows:
-        print("No qualifying opportunities found after applying filters.")
-        return
-
-    # Basic fixed-width formatter (no external table package required).
-    widths = [len(header) for header in headers]
+    widths = [len(h) for h in headers]
     for row in rows:
-        for col_idx, cell in enumerate(row):
-            widths[col_idx] = min(max(widths[col_idx], len(cell)), 80)
+        for idx, value in enumerate(row):
+            widths[idx] = min(max(widths[idx], len(value)), 90)
 
-    def truncate(value: str, max_len: int) -> str:
-        return value if len(value) <= max_len else value[: max_len - 3] + "..."
+    def _clip(text: str, max_len: int) -> str:
+        return text if len(text) <= max_len else text[: max_len - 3] + "..."
 
-    separator = " | "
-    header_line = separator.join(truncate(h, widths[i]).ljust(widths[i]) for i, h in enumerate(headers))
-    divider = "-+-".join("-" * widths[i] for i in range(len(headers)))
-    print(header_line)
-    print(divider)
-
+    sep = " | "
+    print(sep.join(_clip(h, widths[i]).ljust(widths[i]) for i, h in enumerate(headers)))
+    print("-+-".join("-" * w for w in widths))
     for row in rows:
-        line = separator.join(truncate(cell, widths[i]).ljust(widths[i]) for i, cell in enumerate(row))
-        print(line)
+        print(sep.join(_clip(v, widths[i]).ljust(widths[i]) for i, v in enumerate(row)))
 
 
-def save_to_csv(opportunities: List[MarketOpportunity], output_path: str) -> None:
-    """Persist top opportunities to CSV for manual review."""
+def export_csv(opportunities: List[MarketOpportunity], output_path: str = OUTPUT_CSV_PATH) -> None:
+    """Export ranked opportunities to CSV."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    with open(output_path, "w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.writer(csvfile)
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
         writer.writerow(
             [
                 "rank",
@@ -272,10 +258,10 @@ def save_to_csv(opportunities: List[MarketOpportunity], output_path: str) -> Non
             ]
         )
 
-        for idx, item in enumerate(opportunities, start=1):
+        for i, item in enumerate(opportunities, start=1):
             writer.writerow(
                 [
-                    idx,
+                    i,
                     item.market_id,
                     item.question,
                     f"{item.yes_price:.6f}",
@@ -290,15 +276,15 @@ def save_to_csv(opportunities: List[MarketOpportunity], output_path: str) -> Non
 
 
 def main() -> int:
-    """Program entrypoint."""
+    """CLI entrypoint."""
     try:
         markets = fetch_active_markets()
-        opportunities = normalize_and_filter_markets(markets)
-        print_ranked_table(opportunities)
-        save_to_csv(opportunities, config.OUTPUT_CSV_PATH)
-        print(f"\nSaved {len(opportunities)} opportunities to {config.OUTPUT_CSV_PATH}")
+        opportunities = calculate_opportunities(markets)
+        print_table(opportunities)
+        export_csv(opportunities)
+        print(f"\nSaved {len(opportunities)} opportunities to {OUTPUT_CSV_PATH}")
         return 0
-    except Exception as exc:  # Keep top-level handling user-friendly for CLI usage.
+    except Exception as exc:
         print(f"Scanner failed: {exc}")
         return 1
 
