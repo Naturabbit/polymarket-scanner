@@ -3,13 +3,15 @@
 筛选条件：
 1) active=true 且 closed=false
 2) tags 包含 Culture 或 Geopolitics
-3) outcomePrices 任意价格 <= 0.001
+3) outcomePrices 数组中任意价格 <= 0.001
+4) 输出命中的具体选项名称（outcome）与价格
 """
 
 from __future__ import annotations
 
 import json
 from typing import Any, Dict, Iterable, List
+from urllib.parse import quote
 
 import requests
 
@@ -20,20 +22,28 @@ REQUEST_TIMEOUT = 20
 PAGE_LIMIT = 500
 
 
+def _normalize_list(value: Any) -> List[Any]:
+    """将 list 或 JSON 字符串 list 统一为 Python list。"""
+    if isinstance(value, list):
+        return value
+
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(parsed, list):
+            return parsed
+
+    return []
+
+
 def _normalize_tags(raw_tags: Any) -> List[str]:
     """从多种 tag 结构中提取字符串标签。"""
     tags: List[str] = []
+    tag_list = _normalize_list(raw_tags)
 
-    if isinstance(raw_tags, str):
-        try:
-            raw_tags = json.loads(raw_tags)
-        except json.JSONDecodeError:
-            return tags
-
-    if not isinstance(raw_tags, list):
-        return tags
-
-    for tag in raw_tags:
+    for tag in tag_list:
         if isinstance(tag, str):
             tags.append(tag.strip())
         elif isinstance(tag, dict):
@@ -47,24 +57,27 @@ def _normalize_tags(raw_tags: Any) -> List[str]:
 
 def _extract_prices(market: Dict[str, Any]) -> List[float]:
     """提取 outcomePrices 并转换为 float 列表。"""
-    raw_prices = market.get("outcomePrices")
-    if isinstance(raw_prices, str):
-        try:
-            raw_prices = json.loads(raw_prices)
-        except json.JSONDecodeError:
-            return []
-
-    if not isinstance(raw_prices, list):
-        return []
+    raw_prices = _normalize_list(market.get("outcomePrices"))
 
     prices: List[float] = []
     for p in raw_prices:
         try:
             prices.append(float(p))
         except (TypeError, ValueError):
-            continue
+            prices.append(float("nan"))
 
     return prices
+
+
+def _extract_outcomes(market: Dict[str, Any]) -> List[str]:
+    """提取 outcomes（与 outcomePrices 按索引一一对应）。"""
+    raw_outcomes = _normalize_list(market.get("outcomes"))
+    outcomes: List[str] = []
+
+    for item in raw_outcomes:
+        outcomes.append(str(item).strip())
+
+    return outcomes
 
 
 def _passes_tag_filter(tags: Iterable[str]) -> bool:
@@ -111,7 +124,7 @@ def fetch_active_markets() -> List[Dict[str, Any]]:
 
 
 def scan_markets(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """执行标签 + 价格阈值筛选。"""
+    """执行标签筛选 + 多选项低价命中筛选。"""
     results: List[Dict[str, Any]] = []
 
     for market in markets:
@@ -120,24 +133,40 @@ def scan_markets(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
 
         prices = _extract_prices(market)
+        outcomes = _extract_outcomes(market)
         if not prices:
             continue
 
-        if not any(price <= PRICE_THRESHOLD for price in prices):
-            continue
+        # 确保 outcomes 与 prices 按索引对齐，缺失时使用占位名称。
+        if len(outcomes) < len(prices):
+            outcomes.extend([f"Outcome {i + 1}" for i in range(len(outcomes), len(prices))])
 
-        question = str(market.get("question") or market.get("title") or "").strip()
+        question = str(market.get("question") or market.get("title") or "").strip() or "N/A"
         slug = str(market.get("slug") or "").strip()
-        link = f"https://polymarket.com/event/{slug}" if slug else ""
+        event_link = f"https://polymarket.com/event/{slug}" if slug else "N/A"
 
-        results.append(
-            {
-                "question": question,
-                "prices": prices,
-                "tags": tags,
-                "link": link,
-            }
-        )
+        # 深度筛选：逐个 outcomePrice 判断 <= 0.001
+        for idx, price in enumerate(prices):
+            # 过滤 NaN
+            if price != price:
+                continue
+            if price <= PRICE_THRESHOLD:
+                outcome_name = outcomes[idx] if idx < len(outcomes) else f"Outcome {idx + 1}"
+                option_link = (
+                    f"https://polymarket.com/event/{slug}?outcome={quote(outcome_name)}"
+                    if slug
+                    else "N/A"
+                )
+                results.append(
+                    {
+                        "question": question,
+                        "outcome": outcome_name,
+                        "price": price,
+                        "tags": tags,
+                        "event_link": event_link,
+                        "buy_link": option_link,
+                    }
+                )
 
     return results
 
@@ -147,15 +176,16 @@ def print_results(results: List[Dict[str, Any]]) -> None:
         print("未找到符合条件的标的。")
         return
 
-    print(f"共找到 {len(results)} 个符合条件的标的:\n")
+    print(f"共找到 {len(results)} 条符合条件的低价选项:\n")
     for idx, item in enumerate(results, start=1):
-        prices_text = ", ".join(f"{p:.6f}" for p in item["prices"])
         tags_text = ", ".join(item["tags"]) if item["tags"] else "N/A"
 
-        print(f"[{idx}] {item['question'] or 'N/A'}")
-        print(f"    Prices : [{prices_text}]")
-        print(f"    Tags   : {tags_text}")
-        print(f"    Link   : {item['link'] or 'N/A'}")
+        print(f"[{idx}] 市场: {item['question']}")
+        print(f"    Outcome : {item['outcome']}")
+        print(f"    Price   : {item['price']:.6f}")
+        print(f"    Tags    : {tags_text}")
+        print(f"    Event   : {item['event_link']}")
+        print(f"    BuyLink : {item['buy_link']}")
         print()
 
 
