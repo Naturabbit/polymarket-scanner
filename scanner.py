@@ -68,6 +68,8 @@ def fetch_all_markets() -> List[Dict[str, Any]]:
 
     while True:
         params = {
+            "active": "true",
+            "closed": "false",
             "limit": LIMIT,
             "offset": offset,
         }
